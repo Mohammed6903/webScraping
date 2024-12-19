@@ -1,10 +1,12 @@
 const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
 
 async function scrape() {
     const browser = await chromium.launch({ headless: false });
     const page = await browser.newPage();
 
-    // Configure page to handle potential loading issues
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(30000);
 
@@ -13,14 +15,12 @@ async function scrape() {
             waitUntil: 'domcontentloaded' 
         });
 
-        // Handle popup more efficiently
         const closeSelector = 'a.npop-btn.npop-btn_br.trigger.js-npop-btn';
         await page.evaluate((selector) => {
             const popupClose = document.querySelector(selector);
             if (popupClose) popupClose.click();
         }, closeSelector);
 
-        // Use page.evaluate to extract links in one go
         const links = await page.evaluate((containerId) => {
             const container = document.querySelector(containerId);
             if (!container) return [];
@@ -32,29 +32,45 @@ async function scrape() {
 
         console.log(`Found ${links.length} links`);
 
-        // Process links with concurrency and error handling
-        for (const href of links.slice(0, 5)) { // Limit to first 5 for testing
+        for (const href of links) {
             try {
                 console.log(`Processing: ${href}`);
 
-                // Navigate to link
                 await page.goto(href, { 
                     waitUntil: 'domcontentloaded' 
                 });
 
-                // Extract basic content
-                const pageContent = await page.evaluate(() => ({
-                    title: document.title,
-                    description: document.querySelector('meta[name="description"]')?.content || '',
-                    firstParagraph: document.querySelector('p')?.innerText || '',
-                    news: Array.from(document.querySelectorAll('.sp_only-ul-ol p'))
+                const newsContent = await page.evaluate(() => {
+                    const title = document.title;
+                    const description = document.querySelector('meta[name="description"]')?.content || '';
+                    const firstParagraph = document.querySelector('p')?.innerText || '';
+                    const news = Array.from(document.querySelectorAll('.sp_only-ul-ol p'))
                     .map(p => p.innerText)
-                    .filter(text => text.trim() !== '')
-                }));
+                    .filter(text => text.trim() !== '');
+                    const imageElements = Array.from(document.querySelectorAll('picture img'));
+                    const images = imageElements.map(img => img.src).filter(src => src);
+                    return { title, images, news, firstParagraph, description };
+                });
 
-                console.log('Page Details:', pageContent);
+                console.log('Page Details:', newsContent);
 
-                // Optional: Add small delay between requests
+                const newsFolder = path.join(__dirname, 'news', sanitizeFileName(newsContent.title));
+                if (!fs.existsSync(newsFolder)) {
+                    fs.mkdirSync(newsFolder, { recursive: true });
+                }
+
+                // Download images
+                for (let i = 0; i < newsContent.images.length; i++) {
+                    const imageUrl = newsContent.images[i];
+                    const imagePath = path.join(newsFolder, `image_${i + 1}.jpg`);
+                    try {
+                        await downloadImage(imageUrl, imagePath);
+                        console.log(`Downloaded: ${imagePath}`);
+                    } catch (error) {
+                        console.error(`Failed to download ${imageUrl}:`, error.message);
+                    }
+                }
+
                 await page.waitForTimeout(500);
             } catch (error) {
                 console.error(`Error processing ${href}:`, error.message);
@@ -65,6 +81,30 @@ async function scrape() {
     } finally {
         await browser.close();
     }
+}
+
+async function downloadImage(url, filename) {
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(filename);
+        const request = https.get(url, (response) => {
+            if (response.statusCode === 200) {
+                response.pipe(file);
+                file.on('finish', () => {
+                    file.close(resolve);
+                });
+            } else {
+                reject(`Failed to get image: ${response.statusCode}`);
+            }
+        });
+
+        request.on('error', (err) => {
+            fs.unlink(filename, () => reject(err));
+        });
+    });
+}
+
+function sanitizeFileName(name) {
+    return name.replace(/[^a-z0-9_\-]/gi, '_').toLowerCase();
 }
 
 scrape().catch(console.error);
